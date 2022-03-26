@@ -1,7 +1,9 @@
-Catch body filter module for nginx.
+nginx-if-request-body
+=====
 
-This is a test module, to check request body filters experimental
-machinery to be introduced.
+
+For body filter before proxy to backend
+
 
 Example:
 
