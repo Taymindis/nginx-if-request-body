@@ -1,0 +1,621 @@
+
+#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_http.h>
+
+#define MODULE_NAME "nginx_if_request_body"
+
+typedef struct {
+    ngx_http_complex_value_t rule;
+    ngx_int_t status;
+    ngx_flag_t is_starts_with;
+    ngx_flag_t case_sensitive;
+} body_eq_rule;
+
+typedef struct {
+    ngx_http_complex_value_t rule;
+    ngx_int_t status;
+    ngx_flag_t case_sensitive;
+} body_contains_rule;
+
+typedef struct {
+    ngx_regex_t *rule;
+    ngx_int_t status;
+} body_regex_rule;
+
+
+typedef struct {
+    ngx_flag_t         enable;
+    ngx_array_t        *return_if_body_eq_rules;
+    ngx_array_t        *return_if_body_contains_rules;
+    ngx_array_t        *return_if_body_regex_rules;
+} ngx_http_if_request_body_conf_t;
+
+
+static void *ngx_http_if_request_body_create_conf(ngx_conf_t *cf);
+static char *ngx_http_if_request_body_merge_conf(ngx_conf_t *cf, void *parent,
+    void *child);
+static ngx_int_t ngx_http_if_request_body_init(ngx_conf_t *cf);
+
+static char *ngx_http_if_request_body_set_if_regex(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+
+static char *ngx_http_if_request_body_set_if_eq(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_if_request_body_set_if_startswith(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_if_request_body_set_if_contains(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+
+
+static u_char *ngx_http_if_request_body_strncasestr(u_char *s1, size_t len1, u_char *s2, size_t len2);
+
+static u_char *ngx_http_if_request_body_strnstr(u_char *s1, size_t len1, u_char *s2, size_t len2);
+
+
+static ngx_command_t  ngx_http_if_request_body_commands[] = {
+
+    { ngx_string("if_request_body"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+// ngx_http_if_request_body_set_flag_slot
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_if_request_body_conf_t, enable),
+      NULL },
+    { ngx_string("return_status_if_body_eq"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE23,
+      ngx_http_if_request_body_set_if_eq,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+    { ngx_string("return_status_if_body_startswith"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE23,
+      ngx_http_if_request_body_set_if_startswith,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+    { ngx_string("return_status_if_body_contains"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE23,
+      ngx_http_if_request_body_set_if_contains,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+    { ngx_string("return_status_if_body_regex"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
+      ngx_http_if_request_body_set_if_regex,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+      ngx_null_command
+};
+
+
+static ngx_http_module_t  ngx_http_if_request_body_module_ctx = {
+    NULL,                          /* preconfiguration */
+    ngx_http_if_request_body_init,      /* postconfiguration */
+
+    NULL,                          /* create main configuration */
+    NULL,                          /* init main configuration */
+
+    NULL,                          /* create server configuration */
+    NULL,                          /* merge server configuration */
+
+    ngx_http_if_request_body_create_conf, /* create location configuration */
+    ngx_http_if_request_body_merge_conf   /* merge location configuration */
+};
+
+
+ngx_module_t  ngx_http_if_request_body_module = {
+    NGX_MODULE_V1,
+    &ngx_http_if_request_body_module_ctx, /* module context */
+    ngx_http_if_request_body_commands,  /* module directives */
+    NGX_HTTP_MODULE,               /* module type */
+    NULL,                          /* init master */
+    NULL,                          /* init module */
+    NULL,                          /* init process */
+    NULL,                          /* init thread */
+    NULL,                          /* exit thread */
+    NULL,                          /* exit process */
+    NULL,                          /* exit master */
+    NGX_MODULE_V1_PADDING
+};
+
+
+static ngx_http_request_body_filter_pt   ngx_http_next_request_body_filter;
+
+
+static ngx_int_t
+ngx_http_if_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
+{
+    u_char                      *p;
+    ngx_str_t                   req_body;
+    ngx_chain_t                 *cl;
+    ngx_http_if_request_body_conf_t  *conf;
+    ngx_buf_t                   *b;
+    size_t                      len;
+
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_if_request_body_module);
+
+    if (!conf->enable) {
+        return ngx_http_next_request_body_filter(r, in);
+    }
+
+    len=0;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "catch request body filter");
+
+    // TO GET THE LEN FIRST
+    for (cl = in; cl; cl = cl->next) {
+        b = cl->buf;
+        if (b->in_file) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "insufficient client_body_buffer_size");
+            goto SKIP_CHECKING;
+        }
+        len += b->last - b->pos;
+    }
+
+    p = req_body.data = ngx_palloc(r->pool, len);
+    req_body.len = len;
+
+   if (req_body.data == NULL) {
+        ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "insufficient memory.");
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    for (cl = in; cl; cl = cl->next) {
+        p = ngx_copy(p, cl->buf->pos, cl->buf->last - cl->buf->pos);
+    }
+
+    
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "filtering body in: %V", &req_body);
+
+    // TODO CHECK THE RULE NOW
+
+    ngx_http_if_request_body_conf_t *bcf = ngx_http_get_module_loc_conf(r, ngx_http_if_request_body_module);
+
+
+    ngx_uint_t i, nelts;
+    body_eq_rule *eq_rules;
+    body_contains_rule *contains_rules;
+    body_regex_rule *regex_rules;
+    ngx_str_t check_value;
+
+    // EQ OR STARTSWITH RULE
+    if( bcf->return_if_body_eq_rules != NULL ){
+        eq_rules =  bcf->return_if_body_eq_rules->elts;
+        nelts = bcf->return_if_body_eq_rules->nelts;
+
+        for (i = 0; i < nelts; i++) {
+            if (ngx_http_complex_value(r, &eq_rules->rule, &check_value) == NGX_OK) {
+                if(eq_rules->is_starts_with) {
+                    if(req_body.len >= check_value.len){
+                        if(eq_rules->case_sensitive) {
+                            if(ngx_strncmp(req_body.data, check_value.data, check_value.len) == 0) {
+                                return eq_rules->status;
+                            }
+                        } else if (ngx_strncasecmp(req_body.data, check_value.data, check_value.len) == 0) {
+                                return eq_rules->status;
+                        }
+                    }
+                } else if(req_body.len == check_value.len) {
+                    if(eq_rules->case_sensitive) {
+                        if(ngx_strncmp(check_value.data, req_body.data, req_body.len) == 0) {
+                            return eq_rules->status;
+                        }
+                    } else if (ngx_strncasecmp(check_value.data, req_body.data, req_body.len) == 0) {
+                            return eq_rules->status;
+                    }
+                }
+            } else {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "%s", "error when checking the request body");
+            }
+            eq_rules++;
+        }
+    }
+    // EQ OR STARTSWITH RULE END
+
+    // CONTAINS RULE
+    if( bcf->return_if_body_contains_rules != NULL ){
+
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                        "checking contains rule");
+        contains_rules =  bcf->return_if_body_contains_rules->elts;
+        nelts = bcf->return_if_body_contains_rules->nelts;
+
+        for (i = 0; i < nelts; i++) {
+            if (ngx_http_complex_value(r, &contains_rules->rule, &check_value) == NGX_OK) {
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "checking request body \"%V\", with rule \"%V\"",
+                                            &req_body, &check_value);
+                if(req_body.len >= check_value.len) {
+                    if(contains_rules->case_sensitive) {
+                        if( (ngx_http_if_request_body_strnstr(req_body.data, req_body.len,check_value.data,check_value.len)) ) {
+                            return contains_rules->status;
+                        }
+                    } else if ( (ngx_http_if_request_body_strncasestr(req_body.data, req_body.len,check_value.data,check_value.len)) ) {
+                        return contains_rules->status;
+                    }
+                }
+            } else {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "%s", "error when checking the request body");
+            }
+            contains_rules++;
+        }
+    }
+    // CONTAINS RULE END
+
+
+    // REGEX RULE
+
+    if( bcf->return_if_body_regex_rules != NULL ){
+        regex_rules =  bcf->return_if_body_regex_rules->elts;
+        nelts = bcf->return_if_body_regex_rules->nelts;
+
+        for (i = 0; i < nelts; i++) {
+        
+            ngx_int_t  n;
+            int        captures[3];
+
+
+            n = ngx_regex_exec(regex_rules->rule, &req_body, captures, 3);
+            if (n >= 0) {
+                /* string matches expression */
+                return regex_rules->status;
+
+            } else if (n == NGX_REGEX_NO_MATCHED) {
+                /* no match was found */
+            } else {
+                /* some error */
+                ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, ngx_regex_exec_n " failed: %i", n);
+            }
+
+
+            regex_rules++;
+        }
+    }
+    // REGEX RULE END
+
+
+
+
+
+    
+
+SKIP_CHECKING:
+    return ngx_http_next_request_body_filter(r, in);
+}
+
+
+static void *
+ngx_http_if_request_body_create_conf(ngx_conf_t *cf)
+{
+    ngx_http_if_request_body_conf_t  *conf;
+
+    conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_if_request_body_conf_t));
+    if (conf == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    conf->enable = NGX_CONF_UNSET;
+    conf->return_if_body_eq_rules = NGX_CONF_UNSET_PTR;
+    conf->return_if_body_contains_rules = NGX_CONF_UNSET_PTR;
+    conf->return_if_body_regex_rules = NGX_CONF_UNSET_PTR;
+
+    return conf;
+}
+
+
+static char *
+ngx_http_if_request_body_merge_conf(ngx_conf_t *cf, void *parent, void *child)
+{
+    ngx_http_if_request_body_conf_t *prev = parent;
+    ngx_http_if_request_body_conf_t *conf = child;
+
+    ngx_conf_merge_value(conf->enable, prev->enable, 0);
+
+    ngx_conf_merge_ptr_value(conf->return_if_body_eq_rules, prev->return_if_body_eq_rules, NULL);
+    ngx_conf_merge_ptr_value(conf->return_if_body_contains_rules, prev->return_if_body_contains_rules, NULL);
+    ngx_conf_merge_ptr_value(conf->return_if_body_regex_rules, prev->return_if_body_regex_rules, NULL);
+
+    return NGX_CONF_OK;
+}
+
+
+static ngx_int_t
+ngx_http_if_request_body_init(ngx_conf_t *cf)
+{
+    ngx_http_next_request_body_filter = ngx_http_top_request_body_filter;
+    ngx_http_top_request_body_filter = ngx_http_if_request_body_filter;
+
+    return NGX_OK;
+}
+
+static char *
+ngx_http_if_request_body_set_if_eq_(ngx_conf_t *cf, ngx_command_t *cmd, void *conf, ngx_flag_t is_starts_with) {
+    ngx_http_if_request_body_conf_t        *bcf = conf;
+    ngx_str_t                         *value;
+    body_eq_rule                      *br;   
+    // The complex value is to resolve variable feature
+    ngx_http_compile_complex_value_t   ccv;
+
+    value = cf->args->elts;
+    
+
+    if (bcf->return_if_body_eq_rules == NULL || bcf->return_if_body_eq_rules == NGX_CONF_UNSET_PTR) {
+        bcf->return_if_body_eq_rules = ngx_array_create(cf->pool, 2,
+                                                sizeof(body_eq_rule));
+        if (bcf->return_if_body_eq_rules == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    br = ngx_array_push(bcf->return_if_body_eq_rules);
+    if (br == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+
+    ccv.cf = cf;
+    ccv.value = &value[1];
+    ccv.complex_value = &br->rule;
+
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    // TAKE 2
+    br->status = ngx_atoi(value[2].data, value[2].len);
+    if (br->status == NGX_ERROR) {
+        return "invalid status code";
+    }
+
+
+
+    if(cf->args->nelts == 4){
+        if (ngx_strcasecmp(value[3].data, (u_char *) "on") == 0) {
+            br->case_sensitive = 1;
+        } else if (ngx_strcasecmp(value[3].data, (u_char *) "off") == 0) {
+            br->case_sensitive = 0;
+        } else {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                        "invalid value \"%s\" in \"%s\" directive, "
+                        "it must be \"on\" or \"off\"",
+                        value[3].data, cmd->name.data);
+            return NGX_CONF_ERROR;
+        }
+    } else {
+        br->case_sensitive = 1;
+    }
+
+
+    br->is_starts_with = is_starts_with;
+
+    ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0,
+                        "rule eq \"%V\", with status \"%d\" has been register",
+                        &br->rule, br->status);
+
+    return NGX_CONF_OK;
+}
+
+static char *
+ngx_http_if_request_body_set_if_eq(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+    return ngx_http_if_request_body_set_if_eq_(cf, cmd, conf, 0);
+}
+
+
+static char *
+ngx_http_if_request_body_set_if_startswith(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+    return ngx_http_if_request_body_set_if_eq_(cf, cmd, conf, 1);
+}
+
+static char *
+ngx_http_if_request_body_set_if_contains(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+    ngx_http_if_request_body_conf_t        *bcf = conf;
+    ngx_str_t                         *value;
+    body_contains_rule                      *br;   
+    // The complex value is to resolve variable feature
+    ngx_http_compile_complex_value_t   ccv;
+
+    value = cf->args->elts;
+    
+
+    if (bcf->return_if_body_contains_rules == NULL || bcf->return_if_body_contains_rules == NGX_CONF_UNSET_PTR) {
+        bcf->return_if_body_contains_rules = ngx_array_create(cf->pool, 2,
+                                                sizeof(body_contains_rule));
+        if (bcf->return_if_body_contains_rules == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    br = ngx_array_push(bcf->return_if_body_contains_rules);
+    if (br == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+
+    ccv.cf = cf;
+    ccv.value = &value[1];
+    ccv.complex_value = &br->rule;
+
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    // TAKE 2
+    br->status = ngx_atoi(value[2].data, value[2].len);
+    if (br->status == NGX_ERROR) {
+        return "invalid status code";
+    }
+
+
+
+    if(cf->args->nelts == 4){
+        if (ngx_strcasecmp(value[3].data, (u_char *) "on") == 0) {
+            br->case_sensitive = 1;
+        } else if (ngx_strcasecmp(value[3].data, (u_char *) "off") == 0) {
+            br->case_sensitive = 0;
+        } else {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                        "invalid value \"%s\" in \"%s\" directive, "
+                        "it must be \"on\" or \"off\"",
+                        value[3].data, cmd->name.data);
+            return NGX_CONF_ERROR;
+        }
+    } else {
+        br->case_sensitive = 1;
+    }
+
+
+    ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0,
+                        "rule eq \"%V\", with status \"%d\" has been register",
+                        &br->rule, br->status);
+
+    return NGX_CONF_OK;
+}
+
+
+
+static char *
+ngx_http_if_request_body_set_if_regex(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_if_request_body_conf_t  *bcf = conf;
+
+    ngx_str_t                   *value;
+    body_regex_rule             *br;   
+    ngx_regex_compile_t          rc;
+    u_char                       errstr[NGX_MAX_CONF_ERRSTR];
+
+    value = cf->args->elts;
+    value++;
+
+    if (bcf->return_if_body_regex_rules == NULL || bcf->return_if_body_regex_rules == NGX_CONF_UNSET_PTR) {
+        bcf->return_if_body_regex_rules = ngx_array_create(cf->pool, 2,
+                                                sizeof(body_regex_rule));
+        if (bcf->return_if_body_regex_rules == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    br = ngx_array_push(bcf->return_if_body_regex_rules);
+    if (br == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+
+    memset (&rc,'\0',sizeof(ngx_regex_compile_t));
+
+    rc.pool = cf->pool;
+    rc.err.len = NGX_MAX_CONF_ERRSTR;
+    rc.err.data = errstr;
+    rc.pattern = *value;
+
+    if (ngx_regex_compile(&rc) != NGX_OK) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "%V", &rc.err);
+        return NGX_CONF_ERROR;
+    }
+
+    br->rule = rc.regex;
+
+    // TAKE 2
+    value++;
+    br->status = ngx_atoi(value->data, value->len);
+    if (br->status == NGX_ERROR) {
+        return "invalid status code";
+    }
+
+
+    ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0,
+                        "rule regex \"%s\", with status \"%d\" has been register",
+                        &rc.pattern, br->status);
+
+    return  NGX_CONF_OK;
+}
+
+
+
+
+// char *
+// ngx_http_if_request_body_set_flag_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+// {
+//     char  *p = conf;
+
+//     ngx_http_complex_value_t    *cv;
+//     ngx_str_t                   *value;
+
+//     cv = (ngx_http_complex_value_t *) (p + cmd->offset);
+
+//     if (cv->value.data) {
+//         return "is duplicate";
+//     }
+
+//     value = cf->args->elts;
+
+//     if (ndk_http_complex_value_compile (cf, cv, value + 1))
+//         return  NGX_CONF_ERROR;
+
+
+//     return  NGX_CONF_OK;
+// }
+
+
+// REFER ngx_string.c in order to compare case sensitive and second string len
+u_char *
+ngx_http_if_request_body_strnstr(u_char *s1, size_t len1, u_char *s2, size_t len2)
+{
+    u_char  c1, c2;
+
+    c2 = *(u_char *) s2++;
+    len2--;
+
+    do {
+        do {
+            if (len1-- == 0) {
+                return NULL;
+            }
+
+            c1 = *s1++;
+
+            if (c1 == 0) {
+                return NULL;
+            }
+
+        } while (c1 != c2);
+
+        if (len2 > len1) {
+            return NULL;
+        }
+
+    } while (ngx_strncmp(s1, (u_char *) s2, len2) != 0);
+
+    return --s1;
+}
+
+u_char *
+ngx_http_if_request_body_strncasestr(u_char *s1, size_t len1, u_char *s2, size_t len2)
+{
+    u_char  c1, c2;
+
+    c2 = *(u_char *) s2++;
+    len2--;
+
+    do {
+        do {
+            if (len1-- == 0) {
+                return NULL;
+            }
+
+            c1 = *s1++;
+
+            if (c1 == 0) {
+                return NULL;
+            }
+
+        } while (c1 != c2);
+
+        if (len2 > len1) {
+            return NULL;
+        }
+
+    } while (ngx_strncasecmp(s1, (u_char *) s2, len2) != 0);
+
+    return --s1;
+}

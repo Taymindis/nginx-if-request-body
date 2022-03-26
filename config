@@ -1,0 +1,17 @@
+# (C) Taymindis Woon
+# Configuration for ngx_http_if_request_body_module.
+
+ngx_addon_name="ngx_http_if_request_body_module"
+
+if test -n "$ngx_module_link"; then
+    ngx_module_type=HTTP
+    ngx_module_name=$ngx_addon_name
+    ngx_module_deps="$NGX_ADDON_DEPS"
+    ngx_module_srcs="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_if_request_body_module.c"
+    
+    . auto/module
+else
+  HTTP_MODULES="$HTTP_MODULES $ngx_addon_name"
+  NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_if_request_body_module.c"
+  # NGX_ADDON_DEPS="$NGX_ADDON_DEPS $HTTP_LINK_FUNC_DEPS"
+fi
