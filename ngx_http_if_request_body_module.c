@@ -26,10 +26,16 @@ typedef struct {
 
 typedef struct {
     ngx_flag_t         enable;
+    ngx_flag_t         include_body;
     ngx_array_t        *return_if_body_eq_rules;
     ngx_array_t        *return_if_body_contains_rules;
     ngx_array_t        *return_if_body_regex_rules;
 } ngx_http_if_request_body_conf_t;
+
+typedef struct {
+    ngx_int_t     forward_status;
+    ngx_flag_t    include_body;
+} ngx_http_if_request_body_ctx_t;
 
 
 static void *ngx_http_if_request_body_create_conf(ngx_conf_t *cf);
@@ -48,6 +54,7 @@ static u_char *ngx_http_if_request_body_strncasestr(u_char *s1, size_t len1, u_c
 
 static u_char *ngx_http_if_request_body_strnstr(u_char *s1, size_t len1, u_char *s2, size_t len2);
 
+static ngx_int_t ngx_http_if_request_body_handler(ngx_http_request_t *r);
 
 static ngx_command_t  ngx_http_if_request_body_commands[] = {
 
@@ -57,6 +64,13 @@ static ngx_command_t  ngx_http_if_request_body_commands[] = {
 // ngx_http_if_request_body_set_flag_slot
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_if_request_body_conf_t, enable),
+      NULL },
+    { ngx_string("return_with_body"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+// ngx_http_if_request_body_set_flag_slot
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_if_request_body_conf_t, include_body),
       NULL },
     { ngx_string("return_status_if_body_eq"),
       NGX_HTTP_LOC_CONF|NGX_CONF_TAKE23,
@@ -117,60 +131,72 @@ ngx_module_t  ngx_http_if_request_body_module = {
 };
 
 
-static ngx_http_request_body_filter_pt   ngx_http_next_request_body_filter;
+// static ngx_http_request_body_filter_pt   ngx_http_next_request_body_filter;
 
-
+// Return the Final Status
 static ngx_int_t
-ngx_http_if_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
-{
+ngx_http_if_request_body_filter(ngx_http_request_t *r) {
     u_char                      *p;
     ngx_str_t                   req_body;
     ngx_chain_t                 *cl;
-    ngx_http_if_request_body_conf_t  *conf;
+    ngx_http_if_request_body_conf_t  *bcf;
     ngx_buf_t                   *b;
     size_t                      len;
 
-    conf = ngx_http_get_module_loc_conf(r, ngx_http_if_request_body_module);
-
-    if (!conf->enable) {
-        return ngx_http_next_request_body_filter(r, in);
-    }
-
-    len=0;
-
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "catch request body filter");
+                   "intercept request body and filtered");
 
     // TO GET THE LEN FIRST
-    for (cl = in; cl; cl = cl->next) {
-        b = cl->buf;
-        if (b->in_file) {
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "insufficient client_body_buffer_size");
+    if (r->request_body == NULL || r->request_body->bufs == NULL) {
+        goto SKIP_CHECKING;
+    }
+
+    if (r->request_body->bufs->next != NULL) {
+        len = 0;
+        for (cl = r->request_body->bufs; cl; cl = cl->next) {
+            b = cl->buf;
+            if (b->in_file) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "insufficient client_body_buffer_size, expand it before checking");
+                goto SKIP_CHECKING;
+            }
+            len += b->last - b->pos;
+        }
+        if (len == 0) {
             goto SKIP_CHECKING;
         }
-        len += b->last - b->pos;
+
+
+        p = req_body.data = ngx_palloc(r->pool, len);
+        req_body.len = len;
+
+        if (p == NULL) {
+            ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "insufficient memory.");
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        for (cl = r->request_body->bufs; cl; cl = cl->next) {
+            p = ngx_copy(p, cl->buf->pos, cl->buf->last - cl->buf->pos);
+        }
+    } else {
+        b = r->request_body->bufs->buf;
+        if ( !b->pos || (len = ngx_buf_size(b)) == 0) {
+            goto SKIP_CHECKING;
+        }
+        req_body.data = b->pos;
+        req_body.len = len;
     }
-
-    p = req_body.data = ngx_palloc(r->pool, len);
-    req_body.len = len;
-
-   if (req_body.data == NULL) {
-        ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "insufficient memory.");
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    for (cl = in; cl; cl = cl->next) {
-        p = ngx_copy(p, cl->buf->pos, cl->buf->last - cl->buf->pos);
-    }
-
-    
+    // ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0, "request_line=%V \n \
+    //     uri is %V\n \
+    //     args is %V\n \
+    //     extern is %V\n \
+    //     unparsed_uri is %V\n \
+    //     body size is %zu", &r->request_line, &r->uri, &r->args, &r->exten, &r->unparsed_uri, len);
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                    "filtering body in: %V", &req_body);
+                    "checking body : | %V |", &req_body);
 
-    // TODO CHECK THE RULE NOW
+    // CHECK THE RULE NOW
 
-    ngx_http_if_request_body_conf_t *bcf = ngx_http_get_module_loc_conf(r, ngx_http_if_request_body_module);
-
+    bcf = ngx_http_get_module_loc_conf(r, ngx_http_if_request_body_module);
 
     ngx_uint_t i, nelts;
     body_eq_rule *eq_rules;
@@ -272,14 +298,10 @@ ngx_http_if_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     }
     // REGEX RULE END
 
-
-
-
-
-    
-
+// Proceed to the next handler of the current phase. 
+// If the current handler is the last in the current phase, move to the next phase.
 SKIP_CHECKING:
-    return ngx_http_next_request_body_filter(r, in);
+    return NGX_DECLINED;
 }
 
 
@@ -294,6 +316,7 @@ ngx_http_if_request_body_create_conf(ngx_conf_t *cf)
     }
 
     conf->enable = NGX_CONF_UNSET;
+    conf->include_body = NGX_CONF_UNSET;
     conf->return_if_body_eq_rules = NGX_CONF_UNSET_PTR;
     conf->return_if_body_contains_rules = NGX_CONF_UNSET_PTR;
     conf->return_if_body_regex_rules = NGX_CONF_UNSET_PTR;
@@ -309,6 +332,7 @@ ngx_http_if_request_body_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_if_request_body_conf_t *conf = child;
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
+    ngx_conf_merge_value(conf->include_body, prev->include_body, 1);
 
     ngx_conf_merge_ptr_value(conf->return_if_body_eq_rules, prev->return_if_body_eq_rules, NULL);
     ngx_conf_merge_ptr_value(conf->return_if_body_contains_rules, prev->return_if_body_contains_rules, NULL);
@@ -321,15 +345,30 @@ ngx_http_if_request_body_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 static ngx_int_t
 ngx_http_if_request_body_init(ngx_conf_t *cf)
 {
-    ngx_http_next_request_body_filter = ngx_http_top_request_body_filter;
-    ngx_http_top_request_body_filter = ngx_http_if_request_body_filter;
+
+    ngx_http_handler_pt        *h;
+    ngx_http_core_main_conf_t  *cmcf;
+
+    // ngx_http_next_request_body_filter = ngx_http_top_request_body_filter;
+    // ngx_http_top_request_body_filter = ngx_http_if_request_body_filter;
+
+    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_PRECONTENT_PHASE].handlers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    *h = ngx_http_if_request_body_handler;
+
+    return NGX_OK;
 
     return NGX_OK;
 }
 
 static char *
 ngx_http_if_request_body_set_if_eq_(ngx_conf_t *cf, ngx_command_t *cmd, void *conf, ngx_flag_t is_starts_with) {
-    ngx_http_if_request_body_conf_t        *bcf = conf;
+    ngx_http_if_request_body_conf_t   *bcf = conf;
     ngx_str_t                         *value;
     body_eq_rule                      *br;   
     // The complex value is to resolve variable feature
@@ -529,6 +568,70 @@ ngx_http_if_request_body_set_if_regex(ngx_conf_t *cf, ngx_command_t *cmd, void *
 
     return  NGX_CONF_OK;
 }
+
+
+static void
+ngx_http_if_request_body_process(ngx_http_request_t *r) {
+    ngx_http_if_request_body_ctx_t  *ctx;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_if_request_body_module);
+
+    ctx->forward_status = ngx_http_if_request_body_filter(r);
+
+    // In order to pass body as well when returning status
+    r->preserve_body = ctx->include_body;
+
+    r->write_event_handler = ngx_http_core_run_phases;
+    ngx_http_core_run_phases(r);
+}
+
+/**
+* This is Precontent Handler 
+*/
+static ngx_int_t
+ngx_http_if_request_body_handler(ngx_http_request_t *r){
+    ngx_int_t                            rc;
+    ngx_http_if_request_body_ctx_t       *ctx;
+    ngx_http_if_request_body_conf_t      *bcf;
+
+    if (r != r->main) {
+        return NGX_DECLINED;
+    }
+
+    bcf = ngx_http_get_module_loc_conf(r, ngx_http_if_request_body_module);
+
+    if (!bcf->enable) {
+        return NGX_DECLINED;
+    }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "if request body handler");
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_if_request_body_module);
+
+    if (ctx) {
+        return ctx->forward_status;
+    }
+
+    ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_if_request_body_ctx_t));
+    if (ctx == NULL) {
+        return NGX_ERROR;
+    }
+
+    ctx->forward_status = NGX_DONE;
+    ctx->include_body = bcf->include_body;
+
+    ngx_http_set_ctx(r, ctx, ngx_http_if_request_body_module);
+
+    rc = ngx_http_read_client_request_body(r, ngx_http_if_request_body_process);
+    if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+        return rc;
+    }
+
+    ngx_http_finalize_request(r, NGX_DONE);
+
+    return NGX_DONE;
+}
+
 
 
 
