@@ -14,6 +14,10 @@ typedef struct {
 
 typedef struct {
     ngx_http_complex_value_t rule;
+} body_map_rule;
+
+typedef struct {
+    ngx_http_complex_value_t rule;
     ngx_int_t status;
     ngx_flag_t case_sensitive;
 } body_contains_rule;
@@ -24,9 +28,18 @@ typedef struct {
 } body_regex_rule;
 
 
+// Header out
+typedef struct {
+    ngx_str_t key;
+    ngx_http_complex_value_t   value;
+} body_with_header_t;
+
+
 typedef struct {
     ngx_flag_t         enable;
     ngx_flag_t         include_body;
+    ngx_array_t        *headers_for_body_matched;
+    ngx_array_t        *return_status_if_body_map_to;
     ngx_array_t        *return_if_body_eq_rules;
     ngx_array_t        *return_if_body_contains_rules;
     ngx_array_t        *return_if_body_regex_rules;
@@ -38,23 +51,28 @@ typedef struct {
 } ngx_http_if_request_body_ctx_t;
 
 
+
 static void *ngx_http_if_request_body_create_conf(ngx_conf_t *cf);
 static char *ngx_http_if_request_body_merge_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static ngx_int_t ngx_http_if_request_body_init(ngx_conf_t *cf);
 
-static char *ngx_http_if_request_body_set_if_regex(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_add_header_if_body_matched(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_if_request_body_set_map_to(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
+static char *ngx_http_if_request_body_set_if_regex(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_if_request_body_set_if_eq(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_if_request_body_set_if_startswith(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_if_request_body_set_if_contains(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_http_if_request_body_handler(ngx_http_request_t *r);
+
 
 
 static u_char *ngx_http_if_request_body_strncasestr(u_char *s1, size_t len1, u_char *s2, size_t len2);
-
 static u_char *ngx_http_if_request_body_strnstr(u_char *s1, size_t len1, u_char *s2, size_t len2);
+static ngx_int_t ngx_http_if_request_body_massage_header(ngx_http_request_t *r, ngx_http_if_request_body_conf_t *bcf);
+static ngx_int_t ngx_http_if_request_body_add_header_out(ngx_http_request_t *r, ngx_str_t *key, ngx_str_t *val );
 
-static ngx_int_t ngx_http_if_request_body_handler(ngx_http_request_t *r);
 
 static ngx_command_t  ngx_http_if_request_body_commands[] = {
 
@@ -66,8 +84,22 @@ static ngx_command_t  ngx_http_if_request_body_commands[] = {
       offsetof(ngx_http_if_request_body_conf_t, enable),
       NULL },
     { ngx_string("return_with_body"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
+// ngx_http_if_request_body_set_flag_slot
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_if_request_body_conf_t, include_body),
+      NULL },
+    { ngx_string("add_header_if_body_matched"),
+      NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE2,
+      ngx_http_add_header_if_body_matched,
+// ngx_http_if_request_body_set_flag_slot
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_if_request_body_conf_t, include_body),
+      NULL },
+    { ngx_string("return_status_if_body_map_to"),
+      NGX_HTTP_LOC_CONF,
+      ngx_http_if_request_body_set_map_to,
 // ngx_http_if_request_body_set_flag_slot
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_if_request_body_conf_t, include_body),
@@ -215,18 +247,30 @@ ngx_http_if_request_body_filter(ngx_http_request_t *r) {
                     if(req_body.len >= check_value.len){
                         if(eq_rules->case_sensitive) {
                             if(ngx_strncmp(req_body.data, check_value.data, check_value.len) == 0) {
+                                if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                                }
                                 return eq_rules->status;
                             }
                         } else if (ngx_strncasecmp(req_body.data, check_value.data, check_value.len) == 0) {
+                                if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                                }
                                 return eq_rules->status;
                         }
                     }
                 } else if(req_body.len == check_value.len) {
                     if(eq_rules->case_sensitive) {
                         if(ngx_strncmp(check_value.data, req_body.data, req_body.len) == 0) {
+                            if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                            }
                             return eq_rules->status;
                         }
                     } else if (ngx_strncasecmp(check_value.data, req_body.data, req_body.len) == 0) {
+                            if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                            }
                             return eq_rules->status;
                     }
                 }
@@ -253,9 +297,15 @@ ngx_http_if_request_body_filter(ngx_http_request_t *r) {
                 if(req_body.len >= check_value.len) {
                     if(contains_rules->case_sensitive) {
                         if( (ngx_http_if_request_body_strnstr(req_body.data, req_body.len,check_value.data,check_value.len)) ) {
+                            if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                            }
                             return contains_rules->status;
                         }
                     } else if ( (ngx_http_if_request_body_strncasestr(req_body.data, req_body.len,check_value.data,check_value.len)) ) {
+                        if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                        }
                         return contains_rules->status;
                     }
                 }
@@ -282,6 +332,9 @@ ngx_http_if_request_body_filter(ngx_http_request_t *r) {
 
             n = ngx_regex_exec(regex_rules->rule, &req_body, captures, 3);
             if (n >= 0) {
+                if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
                 /* string matches expression */
                 return regex_rules->status;
 
@@ -317,6 +370,8 @@ ngx_http_if_request_body_create_conf(ngx_conf_t *cf)
 
     conf->enable = NGX_CONF_UNSET;
     conf->include_body = NGX_CONF_UNSET;
+    conf->headers_for_body_matched = NGX_CONF_UNSET_PTR;
+    conf->return_status_if_body_map_to = NGX_CONF_UNSET_PTR;
     conf->return_if_body_eq_rules = NGX_CONF_UNSET_PTR;
     conf->return_if_body_contains_rules = NGX_CONF_UNSET_PTR;
     conf->return_if_body_regex_rules = NGX_CONF_UNSET_PTR;
@@ -334,6 +389,8 @@ ngx_http_if_request_body_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_value(conf->include_body, prev->include_body, 1);
 
+    ngx_conf_merge_ptr_value(conf->headers_for_body_matched, prev->headers_for_body_matched, NULL);
+    ngx_conf_merge_ptr_value(conf->return_status_if_body_map_to, prev->return_status_if_body_map_to, NULL);
     ngx_conf_merge_ptr_value(conf->return_if_body_eq_rules, prev->return_if_body_eq_rules, NULL);
     ngx_conf_merge_ptr_value(conf->return_if_body_contains_rules, prev->return_if_body_contains_rules, NULL);
     ngx_conf_merge_ptr_value(conf->return_if_body_regex_rules, prev->return_if_body_regex_rules, NULL);
@@ -633,31 +690,126 @@ ngx_http_if_request_body_handler(ngx_http_request_t *r){
 }
 
 
+static char *
+ngx_http_if_request_body_set_map_to(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_if_request_body_conf_t   *bcf = conf;
+    ngx_str_t                         *value;
+    body_map_rule                      *br;   
+    // The complex value is to resolve variable feature
+    ngx_http_compile_complex_value_t   ccv;
+
+    value = cf->args->elts;
+
+    if (bcf->return_status_if_body_map_to == NULL || bcf->return_status_if_body_map_to == NGX_CONF_UNSET_PTR) {
+        bcf->return_status_if_body_map_to = ngx_array_create(cf->pool, 2,
+                                                sizeof(body_map_rule));
+        if (bcf->return_status_if_body_map_to == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    br = ngx_array_push(bcf->return_status_if_body_map_to);
+    if (br == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+
+    ccv.cf = cf;
+    ccv.value = &value[1];
+    ccv.complex_value = &br->rule;
+
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    return  NGX_CONF_OK;
+}
+
+
+static char *
+ngx_http_add_header_if_body_matched(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+    ngx_http_if_request_body_conf_t         *bcf = conf;
+    ngx_str_t                               *value;
+    body_with_header_t                      *hdr;
+    ngx_http_compile_complex_value_t        ccv;
+
+    value = cf->args->elts;
+
+    if (bcf->headers_for_body_matched == NULL || bcf->headers_for_body_matched == NGX_CONF_UNSET_PTR) {
+        bcf->headers_for_body_matched = ngx_array_create(cf->pool, 2,
+                                                sizeof(body_with_header_t));
+        if (bcf->headers_for_body_matched == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    hdr = ngx_array_push(bcf->headers_for_body_matched);
+    if (hdr == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    hdr->key = value[1];
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+
+    ccv.cf = cf;
+    ccv.value = &value[2];
+    ccv.complex_value = &hdr->value;
+
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+    return NGX_CONF_OK;
+}
+
+static ngx_int_t 
+ngx_http_if_request_body_massage_header(ngx_http_request_t *r, ngx_http_if_request_body_conf_t *bcf) {
+    ngx_uint_t i, nelts;
+    body_with_header_t *hdrs;
+    ngx_str_t hdr_val;
+    ngx_array_t *headers_for_body_matched;
+
+    if(bcf->headers_for_body_matched) {
+        headers_for_body_matched = bcf->headers_for_body_matched;
+        hdrs = headers_for_body_matched->elts;
+        nelts = headers_for_body_matched->nelts;
+
+        for (i = 0; i < nelts; i++) {
+            if (ngx_http_complex_value(r, &hdrs->value, &hdr_val) == NGX_OK) {
+                if (ngx_http_if_request_body_add_header_out(r, &hdrs->key, &hdr_val) == NGX_ERROR) {
+                    return NGX_ERROR;
+                }
+            } else {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, 
+                    "unable to parse headers %V ", &hdrs->key);
+                return NGX_ERROR;
+            }
+        }
+    }
+
+    return NGX_OK;
+}
 
 
 
-// char *
-// ngx_http_if_request_body_set_flag_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
-// {
-//     char  *p = conf;
+static ngx_int_t
+ngx_http_if_request_body_add_header_out(ngx_http_request_t *r, ngx_str_t *key, ngx_str_t *val ) {
+    ngx_table_elt_t *h;
 
-//     ngx_http_complex_value_t    *cv;
-//     ngx_str_t                   *value;
-
-//     cv = (ngx_http_complex_value_t *) (p + cmd->offset);
-
-//     if (cv->value.data) {
-//         return "is duplicate";
-//     }
-
-//     value = cf->args->elts;
-
-//     if (ndk_http_complex_value_compile (cf, cv, value + 1))
-//         return  NGX_CONF_ERROR;
-
-
-//     return  NGX_CONF_OK;
-// }
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "insufficient memory.");
+        return NGX_ERROR;
+    }
+    h->hash = 1; /*to mark HTTP output headers show set 1, show missing set 0*/
+    h->key.len = key->len;
+    h->key.data = key->data;
+    h->value.len = val->len;
+    h->value.data = val->data;
+    return NGX_OK;
+}
 
 
 // REFER ngx_string.c in order to compare case sensitive and second string len
