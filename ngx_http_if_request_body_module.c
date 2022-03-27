@@ -218,12 +218,6 @@ ngx_http_if_request_body_filter(ngx_http_request_t *r) {
         req_body.data = b->pos;
         req_body.len = len;
     }
-    // ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0, "request_line=%V \n \
-    //     uri is %V\n \
-    //     args is %V\n \
-    //     extern is %V\n \
-    //     unparsed_uri is %V\n \
-    //     body size is %zu", &r->request_line, &r->uri, &r->args, &r->exten, &r->unparsed_uri, len);
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                     "checking body : | %V |", &req_body);
 
