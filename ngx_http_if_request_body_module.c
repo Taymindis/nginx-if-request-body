@@ -355,16 +355,15 @@ ngx_http_if_request_body_filter(ngx_http_request_t *r) {
 // If the current handler is the last in the current phase, move to the next phase.
 SKIP_CHECKING:
     // VARIABLE MAP RULE EXTRA BONUS CHECK REGARDLESS have body or not
-    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "Checking map rule");
     if( bcf->return_if_variable_map_to != NULL ){
-                ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "Checking map rule process");
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "Checking map rule process");
 
         map_rules =  bcf->return_if_variable_map_to->elts;
         nelts = bcf->return_if_variable_map_to->nelts;
 
         for (i = 0; i < nelts; i++) {
             if (ngx_http_complex_value(r, &map_rules->rule, &check_value) == NGX_OK) {
-                ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "the value is %V", &check_value);
+                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "the value is %V", &check_value);
 
                 if(check_value.len > 0) {
                     ngx_int_t status = ngx_atoi(check_value.data, check_value.len);
