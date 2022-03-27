@@ -14,7 +14,7 @@ typedef struct {
 
 typedef struct {
     ngx_http_complex_value_t rule;
-} body_map_rule;
+} variable_map_rule;
 
 typedef struct {
     ngx_http_complex_value_t rule;
@@ -39,7 +39,7 @@ typedef struct {
     ngx_flag_t         enable;
     ngx_flag_t         include_body;
     ngx_array_t        *headers_for_body_matched;
-    ngx_array_t        *return_status_if_body_map_to;
+    ngx_array_t        *return_if_variable_map_to;
     ngx_array_t        *return_if_body_eq_rules;
     ngx_array_t        *return_if_body_contains_rules;
     ngx_array_t        *return_if_body_regex_rules;
@@ -58,7 +58,7 @@ static char *ngx_http_if_request_body_merge_conf(ngx_conf_t *cf, void *parent,
 static ngx_int_t ngx_http_if_request_body_init(ngx_conf_t *cf);
 
 static char *ngx_http_add_header_if_body_matched(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
-static char *ngx_http_if_request_body_set_map_to(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_if_variable_map_to(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
 static char *ngx_http_if_request_body_set_if_regex(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_if_request_body_set_if_eq(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
@@ -93,16 +93,14 @@ static ngx_command_t  ngx_http_if_request_body_commands[] = {
     { ngx_string("add_header_if_body_matched"),
       NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE2,
       ngx_http_add_header_if_body_matched,
-// ngx_http_if_request_body_set_flag_slot
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_if_request_body_conf_t, include_body),
+      0,
       NULL },
-    { ngx_string("return_status_if_body_map_to"),
-      NGX_HTTP_LOC_CONF,
-      ngx_http_if_request_body_set_map_to,
-// ngx_http_if_request_body_set_flag_slot
+    { ngx_string("return_status_if_variable_map_to"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_http_if_variable_map_to,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_if_request_body_conf_t, include_body),
+      0,
       NULL },
     { ngx_string("return_status_if_body_eq"),
       NGX_HTTP_LOC_CONF|NGX_CONF_TAKE23,
@@ -177,6 +175,9 @@ ngx_http_if_request_body_filter(ngx_http_request_t *r) {
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "intercept request body and filtered");
+    
+    bcf = ngx_http_get_module_loc_conf(r, ngx_http_if_request_body_module);
+    
 
     // TO GET THE LEN FIRST
     if (r->request_body == NULL || r->request_body->bufs == NULL) {
@@ -228,12 +229,11 @@ ngx_http_if_request_body_filter(ngx_http_request_t *r) {
 
     // CHECK THE RULE NOW
 
-    bcf = ngx_http_get_module_loc_conf(r, ngx_http_if_request_body_module);
-
     ngx_uint_t i, nelts;
     body_eq_rule *eq_rules;
     body_contains_rule *contains_rules;
     body_regex_rule *regex_rules;
+    variable_map_rule *map_rules;
     ngx_str_t check_value;
 
     // EQ OR STARTSWITH RULE
@@ -354,6 +354,37 @@ ngx_http_if_request_body_filter(ngx_http_request_t *r) {
 // Proceed to the next handler of the current phase. 
 // If the current handler is the last in the current phase, move to the next phase.
 SKIP_CHECKING:
+    // VARIABLE MAP RULE EXTRA BONUS CHECK REGARDLESS have body or not
+    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "Checking map rule");
+    if( bcf->return_if_variable_map_to != NULL ){
+                ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "Checking map rule process");
+
+        map_rules =  bcf->return_if_variable_map_to->elts;
+        nelts = bcf->return_if_variable_map_to->nelts;
+
+        for (i = 0; i < nelts; i++) {
+            if (ngx_http_complex_value(r, &map_rules->rule, &check_value) == NGX_OK) {
+                ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "the value is %V", &check_value);
+
+                if(check_value.len > 0) {
+                    ngx_int_t status = ngx_atoi(check_value.data, check_value.len);
+                    if (status == NGX_ERROR) {
+                        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                    }
+                    if(status != 100) { // if 100 Means bypass
+                        if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                        }
+                        return status;
+                    }
+                }
+            } else {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "%s", "error when checking the map rules");
+            }
+            map_rules++;
+        }
+    }
+    // VARIABLE MAP RULE END
     return NGX_DECLINED;
 }
 
@@ -371,7 +402,7 @@ ngx_http_if_request_body_create_conf(ngx_conf_t *cf)
     conf->enable = NGX_CONF_UNSET;
     conf->include_body = NGX_CONF_UNSET;
     conf->headers_for_body_matched = NGX_CONF_UNSET_PTR;
-    conf->return_status_if_body_map_to = NGX_CONF_UNSET_PTR;
+    conf->return_if_variable_map_to = NGX_CONF_UNSET_PTR;
     conf->return_if_body_eq_rules = NGX_CONF_UNSET_PTR;
     conf->return_if_body_contains_rules = NGX_CONF_UNSET_PTR;
     conf->return_if_body_regex_rules = NGX_CONF_UNSET_PTR;
@@ -390,7 +421,7 @@ ngx_http_if_request_body_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->include_body, prev->include_body, 1);
 
     ngx_conf_merge_ptr_value(conf->headers_for_body_matched, prev->headers_for_body_matched, NULL);
-    ngx_conf_merge_ptr_value(conf->return_status_if_body_map_to, prev->return_status_if_body_map_to, NULL);
+    ngx_conf_merge_ptr_value(conf->return_if_variable_map_to, prev->return_if_variable_map_to, NULL);
     ngx_conf_merge_ptr_value(conf->return_if_body_eq_rules, prev->return_if_body_eq_rules, NULL);
     ngx_conf_merge_ptr_value(conf->return_if_body_contains_rules, prev->return_if_body_contains_rules, NULL);
     ngx_conf_merge_ptr_value(conf->return_if_body_regex_rules, prev->return_if_body_regex_rules, NULL);
@@ -691,25 +722,25 @@ ngx_http_if_request_body_handler(ngx_http_request_t *r){
 
 
 static char *
-ngx_http_if_request_body_set_map_to(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+ngx_http_if_variable_map_to(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_if_request_body_conf_t   *bcf = conf;
     ngx_str_t                         *value;
-    body_map_rule                      *br;   
+    variable_map_rule                      *br;   
     // The complex value is to resolve variable feature
     ngx_http_compile_complex_value_t   ccv;
 
     value = cf->args->elts;
 
-    if (bcf->return_status_if_body_map_to == NULL || bcf->return_status_if_body_map_to == NGX_CONF_UNSET_PTR) {
-        bcf->return_status_if_body_map_to = ngx_array_create(cf->pool, 2,
-                                                sizeof(body_map_rule));
-        if (bcf->return_status_if_body_map_to == NULL) {
+    if (bcf->return_if_variable_map_to == NULL || bcf->return_if_variable_map_to == NGX_CONF_UNSET_PTR) {
+        bcf->return_if_variable_map_to = ngx_array_create(cf->pool, 2,
+                                                sizeof(variable_map_rule));
+        if (bcf->return_if_variable_map_to == NULL) {
             return NGX_CONF_ERROR;
         }
     }
 
-    br = ngx_array_push(bcf->return_status_if_body_map_to);
+    br = ngx_array_push(bcf->return_if_variable_map_to);
     if (br == NULL) {
         return NGX_CONF_ERROR;
     }
