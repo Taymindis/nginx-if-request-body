@@ -38,7 +38,8 @@ typedef struct {
 typedef struct {
     ngx_flag_t         enable;
     ngx_flag_t         include_body;
-    ngx_array_t        *headers_for_body_matched;
+    ngx_array_t        *headers_in_if_matched;
+    ngx_array_t        *headers_out_if_matched;
     ngx_array_t        *return_if_variable_map_to;
     ngx_array_t        *return_if_body_eq_rules;
     ngx_array_t        *return_if_body_contains_rules;
@@ -57,7 +58,8 @@ static char *ngx_http_if_request_body_merge_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static ngx_int_t ngx_http_if_request_body_init(ngx_conf_t *cf);
 
-static char *ngx_http_add_header_if_body_matched(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_add_header_in_if_matched(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_add_header_out_if_matched(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_if_variable_map_to(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
 static char *ngx_http_if_request_body_set_if_regex(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
@@ -70,7 +72,8 @@ static ngx_int_t ngx_http_if_request_body_handler(ngx_http_request_t *r);
 
 static u_char *ngx_http_if_request_body_strncasestr(u_char *s1, size_t len1, u_char *s2, size_t len2);
 static u_char *ngx_http_if_request_body_strnstr(u_char *s1, size_t len1, u_char *s2, size_t len2);
-static ngx_int_t ngx_http_if_request_body_massage_header(ngx_http_request_t *r, ngx_http_if_request_body_conf_t *bcf);
+static ngx_int_t ngx_http_if_request_body_parse_headers(ngx_http_request_t *r, ngx_http_if_request_body_conf_t *bcf);
+static ngx_int_t ngx_http_if_request_body_add_header_in(ngx_http_request_t *r, ngx_str_t *key, ngx_str_t *val );
 static ngx_int_t ngx_http_if_request_body_add_header_out(ngx_http_request_t *r, ngx_str_t *key, ngx_str_t *val );
 
 
@@ -90,9 +93,15 @@ static ngx_command_t  ngx_http_if_request_body_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_if_request_body_conf_t, include_body),
       NULL },
-    { ngx_string("add_header_if_body_matched"),
+    { ngx_string("add_header_in_if_matched"),
       NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE2,
-      ngx_http_add_header_if_body_matched,
+      ngx_http_add_header_in_if_matched,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+    { ngx_string("add_header_out_if_matched"),
+      NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE2,
+      ngx_http_add_header_out_if_matched,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -241,13 +250,13 @@ ngx_http_if_request_body_filter(ngx_http_request_t *r) {
                     if(req_body.len >= check_value.len){
                         if(eq_rules->case_sensitive) {
                             if(ngx_strncmp(req_body.data, check_value.data, check_value.len) == 0) {
-                                if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                                if(ngx_http_if_request_body_parse_headers(r, bcf) != NGX_OK) {
                                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                                 }
                                 return eq_rules->status;
                             }
                         } else if (ngx_strncasecmp(req_body.data, check_value.data, check_value.len) == 0) {
-                                if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                                if(ngx_http_if_request_body_parse_headers(r, bcf) != NGX_OK) {
                                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                                 }
                                 return eq_rules->status;
@@ -256,13 +265,13 @@ ngx_http_if_request_body_filter(ngx_http_request_t *r) {
                 } else if(req_body.len == check_value.len) {
                     if(eq_rules->case_sensitive) {
                         if(ngx_strncmp(check_value.data, req_body.data, req_body.len) == 0) {
-                            if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                            if(ngx_http_if_request_body_parse_headers(r, bcf) != NGX_OK) {
                                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
                             }
                             return eq_rules->status;
                         }
                     } else if (ngx_strncasecmp(check_value.data, req_body.data, req_body.len) == 0) {
-                            if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                            if(ngx_http_if_request_body_parse_headers(r, bcf) != NGX_OK) {
                                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
                             }
                             return eq_rules->status;
@@ -291,13 +300,13 @@ ngx_http_if_request_body_filter(ngx_http_request_t *r) {
                 if(req_body.len >= check_value.len) {
                     if(contains_rules->case_sensitive) {
                         if( (ngx_http_if_request_body_strnstr(req_body.data, req_body.len,check_value.data,check_value.len)) ) {
-                            if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                            if(ngx_http_if_request_body_parse_headers(r, bcf) != NGX_OK) {
                                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
                             }
                             return contains_rules->status;
                         }
                     } else if ( (ngx_http_if_request_body_strncasestr(req_body.data, req_body.len,check_value.data,check_value.len)) ) {
-                        if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                        if(ngx_http_if_request_body_parse_headers(r, bcf) != NGX_OK) {
                             return NGX_HTTP_INTERNAL_SERVER_ERROR;
                         }
                         return contains_rules->status;
@@ -326,7 +335,7 @@ ngx_http_if_request_body_filter(ngx_http_request_t *r) {
 
             n = ngx_regex_exec(regex_rules->rule, &req_body, captures, 3);
             if (n >= 0) {
-                if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                if(ngx_http_if_request_body_parse_headers(r, bcf) != NGX_OK) {
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
                 /* string matches expression */
@@ -365,7 +374,7 @@ SKIP_CHECKING:
                         return NGX_HTTP_INTERNAL_SERVER_ERROR;
                     }
                     if(status != 100) { // if 100 Means bypass
-                        if(ngx_http_if_request_body_massage_header(r, bcf) != NGX_OK) {
+                        if(ngx_http_if_request_body_parse_headers(r, bcf) != NGX_OK) {
                             return NGX_HTTP_INTERNAL_SERVER_ERROR;
                         }
                         return status;
@@ -394,7 +403,8 @@ ngx_http_if_request_body_create_conf(ngx_conf_t *cf)
 
     conf->enable = NGX_CONF_UNSET;
     conf->include_body = NGX_CONF_UNSET;
-    conf->headers_for_body_matched = NGX_CONF_UNSET_PTR;
+    conf->headers_in_if_matched = NGX_CONF_UNSET_PTR;
+    conf->headers_out_if_matched = NGX_CONF_UNSET_PTR;
     conf->return_if_variable_map_to = NGX_CONF_UNSET_PTR;
     conf->return_if_body_eq_rules = NGX_CONF_UNSET_PTR;
     conf->return_if_body_contains_rules = NGX_CONF_UNSET_PTR;
@@ -413,7 +423,9 @@ ngx_http_if_request_body_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_value(conf->include_body, prev->include_body, 1);
 
-    ngx_conf_merge_ptr_value(conf->headers_for_body_matched, prev->headers_for_body_matched, NULL);
+    ngx_conf_merge_ptr_value(conf->headers_in_if_matched, prev->headers_in_if_matched, NULL);
+    ngx_conf_merge_ptr_value(conf->headers_out_if_matched, prev->headers_out_if_matched, NULL);
+
     ngx_conf_merge_ptr_value(conf->return_if_variable_map_to, prev->return_if_variable_map_to, NULL);
     ngx_conf_merge_ptr_value(conf->return_if_body_eq_rules, prev->return_if_body_eq_rules, NULL);
     ngx_conf_merge_ptr_value(conf->return_if_body_contains_rules, prev->return_if_body_contains_rules, NULL);
@@ -751,9 +763,8 @@ ngx_http_if_variable_map_to(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return  NGX_CONF_OK;
 }
 
-
 static char *
-ngx_http_add_header_if_body_matched(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+ngx_http_add_header_in_if_matched(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     ngx_http_if_request_body_conf_t         *bcf = conf;
     ngx_str_t                               *value;
     body_with_header_t                      *hdr;
@@ -761,15 +772,51 @@ ngx_http_add_header_if_body_matched(ngx_conf_t *cf, ngx_command_t *cmd, void *co
 
     value = cf->args->elts;
 
-    if (bcf->headers_for_body_matched == NULL || bcf->headers_for_body_matched == NGX_CONF_UNSET_PTR) {
-        bcf->headers_for_body_matched = ngx_array_create(cf->pool, 2,
+    if (bcf->headers_in_if_matched == NULL || bcf->headers_in_if_matched == NGX_CONF_UNSET_PTR) {
+        bcf->headers_in_if_matched = ngx_array_create(cf->pool, 2,
                                                 sizeof(body_with_header_t));
-        if (bcf->headers_for_body_matched == NULL) {
+        if (bcf->headers_in_if_matched == NULL) {
             return NGX_CONF_ERROR;
         }
     }
 
-    hdr = ngx_array_push(bcf->headers_for_body_matched);
+    hdr = ngx_array_push(bcf->headers_in_if_matched);
+    if (hdr == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    hdr->key = value[1];
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+
+    ccv.cf = cf;
+    ccv.value = &value[2];
+    ccv.complex_value = &hdr->value;
+
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+    return NGX_CONF_OK;
+}
+
+static char *
+ngx_http_add_header_out_if_matched(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+    ngx_http_if_request_body_conf_t         *bcf = conf;
+    ngx_str_t                               *value;
+    body_with_header_t                      *hdr;
+    ngx_http_compile_complex_value_t        ccv;
+
+    value = cf->args->elts;
+
+    if (bcf->headers_out_if_matched == NULL || bcf->headers_out_if_matched == NGX_CONF_UNSET_PTR) {
+        bcf->headers_out_if_matched = ngx_array_create(cf->pool, 2,
+                                                sizeof(body_with_header_t));
+        if (bcf->headers_out_if_matched == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    hdr = ngx_array_push(bcf->headers_out_if_matched);
     if (hdr == NULL) {
         return NGX_CONF_ERROR;
     }
@@ -789,16 +836,35 @@ ngx_http_add_header_if_body_matched(ngx_conf_t *cf, ngx_command_t *cmd, void *co
 }
 
 static ngx_int_t 
-ngx_http_if_request_body_massage_header(ngx_http_request_t *r, ngx_http_if_request_body_conf_t *bcf) {
+ngx_http_if_request_body_parse_headers(ngx_http_request_t *r, ngx_http_if_request_body_conf_t *bcf) {
     ngx_uint_t i, nelts;
     body_with_header_t *hdrs;
     ngx_str_t hdr_val;
-    ngx_array_t *headers_for_body_matched;
+    ngx_array_t *headers_in_if_matched;
+    ngx_array_t *headers_out_if_matched;
 
-    if(bcf->headers_for_body_matched) {
-        headers_for_body_matched = bcf->headers_for_body_matched;
-        hdrs = headers_for_body_matched->elts;
-        nelts = headers_for_body_matched->nelts;
+    if(bcf->headers_in_if_matched) {
+        headers_in_if_matched = bcf->headers_in_if_matched;
+        hdrs = headers_in_if_matched->elts;
+        nelts = headers_in_if_matched->nelts;
+
+        for (i = 0; i < nelts; i++) {
+            if (ngx_http_complex_value(r, &hdrs->value, &hdr_val) == NGX_OK) {
+                if (ngx_http_if_request_body_add_header_in(r, &hdrs->key, &hdr_val) == NGX_ERROR) {
+                    return NGX_ERROR;
+                }
+            } else {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, 
+                    "unable to parse headers %V ", &hdrs->key);
+                return NGX_ERROR;
+            }
+        }
+    }
+
+    if(bcf->headers_out_if_matched) {
+        headers_out_if_matched = bcf->headers_out_if_matched;
+        hdrs = headers_out_if_matched->elts;
+        nelts = headers_out_if_matched->nelts;
 
         for (i = 0; i < nelts; i++) {
             if (ngx_http_complex_value(r, &hdrs->value, &hdr_val) == NGX_OK) {
@@ -832,6 +898,35 @@ ngx_http_if_request_body_add_header_out(ngx_http_request_t *r, ngx_str_t *key, n
     h->key.data = key->data;
     h->value.len = val->len;
     h->value.data = val->data;
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_if_request_body_add_header_in(ngx_http_request_t *r, ngx_str_t *key, ngx_str_t *val ) {
+    ngx_table_elt_t *h;
+    ngx_http_header_t *hh;
+    ngx_http_core_main_conf_t *cmcf;
+
+    h = ngx_list_push(&r->headers_in.headers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    h->key.len = key->len;
+    h->key.data = key->data;
+    h->hash = ngx_hash_key(h->key.data, h->key.len);
+    h->value.len = val->len;
+    h->value.data = val->data;
+
+    h->lowcase_key = h->key.data;
+    cmcf = ngx_http_get_module_main_conf(r, ngx_http_core_module);
+
+    hh = ngx_hash_find(&cmcf->headers_in_hash, h->hash, h->lowcase_key, h->key.len);
+
+    if (hh && hh->handler(r, h, hh->offset) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
     return NGX_OK;
 }
 
