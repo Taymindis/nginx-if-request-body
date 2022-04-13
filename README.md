@@ -32,6 +32,7 @@ http {
             return_status_if_body_startswith "report" 418;
             return_status_if_body_contains "report" 418;
             return_status_if_body_regex "^[\d]+?abc" 418;
+            return_status_if_variable_map_to $forward_status;
             proxy_pass http://localhost:7777;
 
         }
