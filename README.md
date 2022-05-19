@@ -15,6 +15,11 @@ http {
         default 100; # 100 means nothing return, continue to proxy phase
         "~*.+?\.(css|js|bmp|gif|ico|jpeg|jpg|pict|png|svg|swf|tif)$" 418;
     }
+   map "$request_body" $forward_status_by_body {
+        default 100;
+        "abc123xxx" 418;
+        "~*.+?\.(css|js|bmp|gif|ico|jpeg|jpg|pict|png|svg|swf|tif)$" 418;
+    }
 
   server {
    ...
@@ -33,6 +38,7 @@ http {
             return_status_if_body_contains "report" 418;
             return_status_if_body_regex "^[\d]+?abc" 418;
             return_status_if_variable_map_to $forward_status;
+            return_status_if_variable_map_to $forward_status_by_body;
             proxy_pass http://localhost:7777;
 
         }
