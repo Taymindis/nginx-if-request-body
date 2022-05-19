@@ -25,7 +25,7 @@ http {
    ...
         error_page 418 =200 @welcome_if_request_body;
 
-        location @welcome_if_request_body; {
+        location @welcome_if_request_body {
             add_header Content-Type text/plain;
             return 200 "welcome_if_request_body, you hit it";
         }
