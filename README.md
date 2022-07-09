@@ -24,7 +24,12 @@ http {
   server {
    ...
         error_page 418 =200 @welcome_if_request_body;
-
+        error_page 419 =200 @proxy_via_if_request_body;
+        
+         location @proxy_via_if_request_body {
+           proxy_pass http://$http_forward_proxy;
+        }
+        
         location @welcome_if_request_body {
             add_header Content-Type text/plain;
             return 200 "welcome_if_request_body, you hit it";
@@ -38,8 +43,10 @@ http {
             return_status_if_body_startswith "report" 418;
             return_status_if_body_contains "report" 418;
             return_status_if_body_regex "^[\d]+?abc" 418;
+            return_status_if_body_regex "^vendor_api.*" 419;
             return_status_if_variable_map_to $forward_status;
             return_status_if_variable_map_to $forward_status_by_body;
+            add_header_in_if_matched "forward-proxy" $upstream_name;
             proxy_pass http://localhost:7777;
 
         }
